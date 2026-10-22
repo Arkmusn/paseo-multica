@@ -51,10 +51,37 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+// 从 Paseo 插件进程继承的环境里剔除 Paseo 自己的 provider 注入。
+// 否则 `multica daemon restart` 会把这些变量带给 Multica daemon，
+// 之后 Multica 拉起的 opencode 就会加载 Paseo 的 bridge 插件，报
+// “OpenCode session is not bound to a Paseo agent”。
+function cleanEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of [
+    "OPENCODE_CONFIG_CONTENT",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "OPENCODE",
+    "OPENCODE_PID",
+    "PASEO_AGENT_ID",
+    "PASEO_AGENT_CWD",
+    "PASEO_HOME",
+    "PASEO_CLI",
+    "PASEO_ACP_MODE",
+    "PASEO_PROVIDER",
+    "PASEO_MULTICA_PROJECT_ROOT",
+    "__CFBundleIdentifier",
+    "_CI___CFBundleIdentifier",
+  ]) {
+    delete env[key];
+  }
+  return env;
+}
+
 // profile 非空时作为全局标志前置：multica --profile <p> <sub...>
 function runMultica(bin: string, args: string[], profile?: string): { ok: boolean; stdout: string; stderr: string } {
   const full = profile && profile.trim() ? ["--profile", profile.trim(), ...args] : args;
-  const res = spawnSync(bin, full, { encoding: "utf8", timeout: WRAPPER_TIMEOUT, env: process.env });
+  const res = spawnSync(bin, full, { encoding: "utf8", timeout: WRAPPER_TIMEOUT, env: cleanEnv() });
   return { ok: res.status === 0, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
 
