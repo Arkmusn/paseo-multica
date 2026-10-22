@@ -26074,10 +26074,100 @@ function mapToolKind(kind) {
       return "other";
   }
 }
+function toolContent(output2) {
+  if (output2 === void 0 || output2 === null) return null;
+  const text = typeof output2 === "string" ? output2 : extractOutputText(output2);
+  if (!text) return null;
+  return [{ type: "content", content: { type: "text", text } }];
+}
+function extractOutputText(output2) {
+  if (!output2 || typeof output2 !== "object") return "";
+  const record2 = output2;
+  for (const key of ["output", "content", "result", "log"]) {
+    const value = record2[key];
+    if (typeof value === "string" && value) return value;
+  }
+  if (Array.isArray(record2.filePaths) && record2.filePaths.length) {
+    return record2.filePaths.filter((p) => typeof p === "string").join("\n");
+  }
+  return "";
+}
+function hasToolInput(input2) {
+  if (input2 === void 0 || input2 === null) return false;
+  if (typeof input2 === "string") return input2.trim().length > 0;
+  if (Array.isArray(input2)) return input2.length > 0;
+  if (typeof input2 === "object") return Object.keys(input2).length > 0;
+  return true;
+}
+function mergeToolUpdate(prev, next) {
+  const p = prev.tool ?? {};
+  const n = next.tool ?? {};
+  return {
+    ...next,
+    tool: {
+      ...p,
+      ...n,
+      id: n.id ?? p.id,
+      input: hasToolInput(n.input) ? n.input : p.input,
+      output: n.output !== void 0 ? n.output : p.output,
+      title: n.title ?? p.title,
+      status: n.status ?? p.status
+    }
+  };
+}
 function buildAgentApp(bridge, options) {
   let connection = null;
   let isDiscovery = false;
   const seenTools = /* @__PURE__ */ new Map();
+  const pendingTools = /* @__PURE__ */ new Map();
+  let emitQueue = Promise.resolve();
+  function enqueueEmit(sessionId, update) {
+    emitQueue = emitQueue.then(() => emit(sessionId, update)).catch((error62) => {
+      process.stderr.write(`[harness] emit failed: ${String(error62)}
+`);
+    });
+  }
+  function drainEmits() {
+    return emitQueue;
+  }
+  async function sendToolNow(sessionId, id, update, asUpdate) {
+    if (!connection) return;
+    const rawInput = update.tool?.input;
+    const rawOutput = update.tool?.output;
+    const content = toolContent(rawOutput);
+    await connection.client.notify("session/update", {
+      sessionId,
+      update: {
+        sessionUpdate: asUpdate ? "tool_call_update" : "tool_call",
+        toolCallId: id,
+        title: update.tool?.title ?? update.text,
+        kind: update.tool?.kind ?? "other",
+        status: update.tool?.status ?? "in_progress",
+        ...rawInput !== void 0 ? { rawInput } : {},
+        ...rawOutput !== void 0 ? { rawOutput } : {},
+        ...content ? { content } : {}
+      }
+    });
+  }
+  function queueTool(sessionId, id, update, asUpdate) {
+    emitQueue = emitQueue.then(() => sendToolNow(sessionId, id, update, asUpdate)).catch((error62) => {
+      process.stderr.write(`[harness] send tool failed: ${String(error62)}
+`);
+    });
+    return emitQueue;
+  }
+  async function flushTool(sessionId, id) {
+    const pending = pendingTools.get(id);
+    if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    pendingTools.delete(id);
+    seenTools.get(sessionId)?.add(id);
+    await queueTool(sessionId, id, pending.update, false);
+  }
+  async function flushAllTools(sessionId) {
+    const ids = [...pendingTools.keys()];
+    for (const id of ids) await flushTool(sessionId, id);
+  }
   async function emit(sessionId, update) {
     if (!connection) return;
     if (update.kind === "agent_text") {
@@ -26099,17 +26189,31 @@ function buildAgentApp(bridge, options) {
       const seen = seenTools.get(sessionId) ?? /* @__PURE__ */ new Set();
       seenTools.set(sessionId, seen);
       const first = !seen.has(id);
-      seen.add(id);
-      await connection.client.notify("session/update", {
-        sessionId,
-        update: {
-          sessionUpdate: first ? "tool_call" : "tool_call_update",
-          toolCallId: id,
-          title: update.tool?.title ?? update.text,
-          kind: update.tool?.kind ?? "other",
-          status: update.tool?.status ?? "in_progress"
+      const rawInput = update.tool?.input;
+      const terminal = update.tool?.status === "completed" || update.tool?.status === "failed";
+      if (first && !hasToolInput(rawInput) && !terminal) {
+        const pending2 = pendingTools.get(id);
+        if (pending2) {
+          pending2.update = mergeToolUpdate(pending2.update, update);
+        } else {
+          pendingTools.set(id, {
+            update,
+            timer: setTimeout(() => {
+              void flushTool(sessionId, id);
+            }, 5e3)
+          });
         }
-      });
+        return;
+      }
+      const pending = pendingTools.get(id);
+      const asUpdate = !first && !pending;
+      const merged = pending ? mergeToolUpdate(pending.update, update) : update;
+      if (pending) {
+        if (pending.timer) clearTimeout(pending.timer);
+        pendingTools.delete(id);
+      }
+      seen.add(id);
+      await sendToolNow(sessionId, id, merged, asUpdate);
       return;
     }
     if (update.kind === "plan") {
@@ -26220,10 +26324,12 @@ function buildAgentApp(bridge, options) {
       params.sessionId,
       text,
       (update) => {
-        void emit(params.sessionId, update);
+        enqueueEmit(params.sessionId, update);
       },
       (ask) => askPermission(params.sessionId, ask)
     );
+    await flushAllTools(params.sessionId);
+    await drainEmits();
     return { stopReason: result.stopReason };
   }).onNotification("session/cancel", async (ctx) => {
     const params = ctx.params;
@@ -123320,6 +123426,51 @@ function sameDirectory(a, b) {
     return a === b;
   }
 }
+function handoffPath() {
+  return (0, import_node_path.join)((0, import_node_os.homedir)(), ".paseo", "plugin-data", "paseo-multica", "issue-handoffs.jsonl");
+}
+function recordHandoff(issueId, summary) {
+  try {
+    const dir = (0, import_node_path.join)((0, import_node_os.homedir)(), ".paseo", "plugin-data", "paseo-multica");
+    (0, import_node_fs.mkdirSync)(dir, { recursive: true });
+    (0, import_node_fs.appendFileSync)(
+      handoffPath(),
+      `${JSON.stringify({
+        issueId,
+        summary,
+        serverUrl: process.env.MULTICA_SERVER_URL ?? "",
+        multicaWorkspaceId: process.env.MULTICA_WORKSPACE_ID ?? "",
+        at: (/* @__PURE__ */ new Date()).toISOString()
+      })}
+`
+    );
+  } catch {
+  }
+}
+function readHandoff(issueId) {
+  if (!issueId) return null;
+  let content = "";
+  try {
+    content = (0, import_node_fs.readFileSync)(handoffPath(), "utf8");
+  } catch {
+    return null;
+  }
+  const expectedServer = (process.env.MULTICA_SERVER_URL ?? "").replace(/\/+$/, "");
+  const expectedWorkspace = process.env.MULTICA_WORKSPACE_ID ?? "";
+  let found = null;
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row.issueId !== issueId || !row.summary) continue;
+      if (expectedServer && (row.serverUrl ?? "").replace(/\/+$/, "") !== expectedServer) continue;
+      if (expectedWorkspace && row.multicaWorkspaceId !== expectedWorkspace) continue;
+      if (!found || (row.at ?? "") > found.at) found = row;
+    } catch {
+    }
+  }
+  return found?.summary ?? null;
+}
 async function findReusableWorkspace(client, issueId, cwd) {
   const record2 = readIssueWorkspace(issueId);
   if (!record2) return null;
@@ -123362,7 +123513,7 @@ async function ensureMulticaProjectId(client) {
     return void 0;
   }
 }
-function recordTaskSession(agentId, paseoWorkspaceId) {
+function recordTaskSession(agentId, paseoWorkspaceId, issueId) {
   const taskId = process.env.MULTICA_TASK_ID;
   if (!taskId || !paseoWorkspaceId) return;
   try {
@@ -123374,6 +123525,7 @@ function recordTaskSession(agentId, paseoWorkspaceId) {
         taskId,
         agentId,
         paseoWorkspaceId,
+        ...issueId ? { issueId } : {},
         serverUrl: process.env.MULTICA_SERVER_URL ?? "",
         multicaWorkspaceId: process.env.MULTICA_WORKSPACE_ID ?? "",
         at: (/* @__PURE__ */ new Date()).toISOString()
@@ -123382,6 +123534,51 @@ function recordTaskSession(agentId, paseoWorkspaceId) {
     );
   } catch {
   }
+}
+function recordedIssueId(agentId) {
+  const path = (0, import_node_path.join)((0, import_node_os.homedir)(), ".paseo", "plugin-data", "paseo-multica", "task-sessions.jsonl");
+  try {
+    const lines = (0, import_node_fs.readFileSync)(path, "utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line || !line.trim()) continue;
+      const row = JSON.parse(line);
+      if (row.agentId === agentId && row.issueId) return row.issueId;
+    }
+  } catch {
+  }
+  return "";
+}
+async function summarizeSession(client, agentId) {
+  try {
+    const agent2 = client.agents.ref(agentId);
+    const page = await agent2.timeline.refetch({ direction: "tail", limit: 200 });
+    const entries = page.entries ?? [];
+    if (!entries.length) return null;
+    const lines = [];
+    for (const entry of entries) {
+      const item = entry.item;
+      if (!item?.type) continue;
+      if (item.type === "assistant_message" && item.text?.trim()) {
+        lines.push(`- \u52A9\u624B\uFF1A${trimText(item.text, 400)}`);
+        continue;
+      }
+      if (item.type === "tool_call") {
+        lines.push(`- \u5DE5\u5177 ${item.name ?? "tool"}\uFF1A${trimText(toolDetailTitle(item.detail, item.name), 200)} [${item.status ?? "?"}]`);
+      }
+    }
+    if (!lines.length) return null;
+    const recent = lines.slice(-40).join("\n");
+    return trimText(recent, 6e3);
+  } catch (error62) {
+    process.stderr.write(`[harness] summarize failed agent=${agentId}: ${String(error62)}
+`);
+    return null;
+  }
+}
+function trimText(text, max) {
+  const normalized = text.trim();
+  return normalized.length <= max ? normalized : `${normalized.slice(0, max)}\u2026`;
 }
 var DEFAULT_PROVIDER = process.env.PASEO_PROVIDER?.trim() ?? "";
 function forwardMulticaEnv() {
@@ -123616,10 +123813,20 @@ async function createRealBridge(url3) {
       if (actual && currentTaskId) {
         const recordedTaskId = actual.labels?.["multica.taskId"] || readRecordedTaskId(sessionId);
         if (recordedTaskId !== currentTaskId) {
-          process.stderr.write(
-            `[harness] resume rejected: task ${recordedTaskId || "<unknown>"} -> ${currentTaskId} (agent ${sessionId})
+          const summary = await summarizeSession(client, sessionId);
+          if (summary) {
+            const issueId = recordedIssueId(sessionId);
+            if (issueId) recordHandoff(issueId, summary);
+            process.stderr.write(
+              `[harness] resume rejected with handoff: task ${recordedTaskId || "<unknown>"} -> ${currentTaskId} (agent ${sessionId}, issue ${issueId || "<unknown>"}, summary ${summary.length}B)
 `
-          );
+            );
+          } else {
+            process.stderr.write(
+              `[harness] resume rejected: task ${recordedTaskId || "<unknown>"} -> ${currentTaskId} (agent ${sessionId})
+`
+            );
+          }
           throw new RequestError(-32603, "Session not found");
         }
       }
@@ -123696,8 +123903,24 @@ async function createRealBridge(url3) {
       const entry = sessions.get(sessionId);
       if (!entry) throw new Error(`unknown session: ${sessionId}`);
       await ensureConnected();
+      let prompt = text;
       if (!entry.existing) {
         const issueId = issueIdFromPrompt(text);
+        const handoff2 = issueId ? readHandoff(issueId) : null;
+        if (handoff2) {
+          prompt = [
+            "## \u4E0A\u4E00\u8F6E\u8FDB\u5EA6\uFF08\u540C\u4E00 issue \u7684\u4E0A\u4E00\u4F1A\u8BDD\u56E0\u4EE4\u724C\u8F6E\u6362\u65E0\u6CD5\u590D\u7528\uFF0C\u4EE5\u4E0B\u662F\u5176\u6458\u8981\uFF09",
+            handoff2,
+            "",
+            "\u8BF7\u5728\u6B64\u57FA\u7840\u4E0A\u7EE7\u7EED\uFF0C\u4E0D\u8981\u91CD\u590D\u5DF2\u5B8C\u6210\u7684\u5DE5\u4F5C\u3002",
+            "",
+            "---",
+            "",
+            text
+          ].join("\n");
+          process.stderr.write(`[harness] handoff injected issue=${issueId} ${handoff2.length}B
+`);
+        }
         if (!entry.title) {
           const fromIssue = await fetchIssueTitle(issueId);
           entry.title = fromIssue || "Multica \u4EFB\u52A1";
@@ -123748,7 +123971,7 @@ async function createRealBridge(url3) {
           ...process.env.MULTICA_TASK_ID ? { labels: { "multica.taskId": process.env.MULTICA_TASK_ID } } : {}
         });
         entry.existing = true;
-        recordTaskSession(entry.agentId, entry.workspace.id);
+        recordTaskSession(entry.agentId, entry.workspace.id, issueId);
         const created = await client.agents.ref(entry.agentId).refresh().catch(() => null);
         const yoloDesc = yolo.featureValues ? `features=${JSON.stringify(yolo.featureValues)}` : yolo.modeId ? `mode=${yolo.modeId}` : "yolo=(provider default)";
         process.stderr.write(
@@ -123759,7 +123982,7 @@ async function createRealBridge(url3) {
       const agent2 = client.agents.ref(entry.agentId);
       let pendingPermission = null;
       const subscription = agent2.timeline.subscribe((event) => {
-        if (process.env.PASEO_ACP_DEBUG) {
+        if (process.env.MULTICA_HARNESS_DEBUG) {
           process.stderr.write(`[bridge] event=${JSON.stringify(event)}
 `);
         }
@@ -123773,7 +123996,7 @@ async function createRealBridge(url3) {
       });
       await subscription.ready;
       try {
-        let result = await agent2.run(text);
+        let result = await agent2.run(prompt);
         let guard = 0;
         while (result.status === "permission" && guard < 50) {
           const pending = pendingPermission;
@@ -123854,7 +124077,9 @@ function toBridgeUpdate(event) {
           id: item.callId,
           title: toolDetailTitle(item.detail, item.name),
           status: toolStatus(item.status),
-          kind: toolDetailKind(item.detail?.type)
+          kind: toolDetailKind(item.detail?.type),
+          input: toolDetailInput(item.detail),
+          output: toolDetailOutput(item.detail)
         }
       };
     case "todo":
@@ -123868,6 +124093,78 @@ function toBridgeUpdate(event) {
       };
     default:
       return null;
+  }
+}
+function toolDetailInput(detail) {
+  const d = detail;
+  if (!d) return void 0;
+  switch (d.type) {
+    case "shell":
+      return { command: d.command, cwd: d.cwd };
+    case "read": {
+      const out = { filePath: d.filePath };
+      if (d.offset !== void 0) out.offset = d.offset;
+      if (d.limit !== void 0) out.limit = d.limit;
+      return out;
+    }
+    case "edit":
+      return { filePath: d.filePath, oldString: d.oldString, newString: d.newString };
+    case "write":
+      return { filePath: d.filePath, content: d.content };
+    case "search":
+      return { query: d.query, toolName: d.toolName };
+    case "fetch":
+      return { url: d.url, prompt: d.prompt };
+    case "plan":
+      return { text: d.text };
+    case "sub_agent":
+      return { subAgentType: d.subAgentType, description: d.description };
+    case "plain_text":
+      return { label: d.label };
+    default:
+      return salvageToolInput(d);
+  }
+}
+function salvageToolInput(detail) {
+  const nested = detail.input;
+  const source = nested && typeof nested === "object" ? nested : detail;
+  const picked = {};
+  for (const key of ["command", "filePath", "path", "query", "url", "prompt", "content", "oldString", "newString", "cwd", "workdir"]) {
+    if (source[key] !== void 0) picked[key] = source[key];
+  }
+  if (Object.keys(picked).length > 0) return picked;
+  return nested ?? void 0;
+}
+function toolDetailOutput(detail) {
+  const d = detail;
+  if (!d) return void 0;
+  switch (d.type) {
+    case "shell": {
+      const out = { output: d.output };
+      if (d.exitCode !== void 0) out.exitCode = d.exitCode;
+      return out;
+    }
+    case "read":
+      return { content: d.content };
+    case "edit":
+      return { unifiedDiff: d.unifiedDiff };
+    case "write":
+      return void 0;
+    case "search": {
+      const out = { content: d.content };
+      if (d.filePaths) out.filePaths = d.filePaths;
+      if (d.numFiles !== void 0) out.numFiles = d.numFiles;
+      if (d.numMatches !== void 0) out.numMatches = d.numMatches;
+      return out;
+    }
+    case "fetch":
+      return { result: d.result, code: d.code };
+    case "sub_agent":
+      return { log: d.log };
+    case "plan":
+      return void 0;
+    default:
+      return d.output;
   }
 }
 function toolDetailTitle(detail, fallback) {
