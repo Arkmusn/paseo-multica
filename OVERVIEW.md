@@ -30,7 +30,7 @@
 
 「运行时接入」视图（从「Multica」看板顶栏进入）把本机 Paseo 注册成一个自定义 Multica 运行时（走 ACP，协议族默认 `dim`），此后 Multica 派发的卡片任务会由本机 Paseo（经 `paseo-acp-harness`）执行，Paseo 的实时输出会回流为 Multica 的任务消息，Multica 选择的模型也会透传给 Paseo。
 
-接入后：Multica 把卡片派给绑定该运行时的 agent，任务由本机 Paseo 执行；所有任务会归入 Multica 工作区根目录对应的 Paseo 项目（daemon 注入的 `MULTICA_TASK_WORKSPACES_ROOT`，默认 `~/multica_workspaces`，可用 `PASEO_MULTICA_PROJECT_ROOT` 覆盖），每个任务仍有独立的 workspace 与 agent tab；同一卡片续跑时 harness 会**复用同一个 Paseo 工作区/对话**（`session/resume`），而不是每次新建；Multica 选的模型与推理档位、以及（Paseo 侧发起的）工具权限都会透传。
+接入后：Multica 把卡片派给绑定该运行时的 agent，任务由本机 Paseo 执行；跨任务的续跑会新建会话（Multica 的 task token 按任务吊销，Paseo agent 的环境变量只在创建时生效），但同一 issue 复用同一个 Paseo workspace，每个新任务只新增 agent tab；同一任务内的续跑仍复用原会话；所有任务会归入 Multica 工作区根目录对应的 Paseo 项目（daemon 注入的 `MULTICA_TASK_WORKSPACES_ROOT`，默认 `~/multica_workspaces`，可用 `PASEO_MULTICA_PROJECT_ROOT` 覆盖），每个任务仍有独立的 workspace 与 agent tab；同一卡片续跑时 harness 会**复用同一个 Paseo 工作区/对话**（`session/resume`），而不是每次新建；Multica 选的模型与推理档位、以及（Paseo 侧发起的）工具权限都会透传。
 
 「一键接入」幂等地执行：
 

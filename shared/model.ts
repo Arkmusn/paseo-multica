@@ -25,7 +25,8 @@ export const RuntimeSettingsSchema = z.object({
   runtimeType: z.string().default("dim"),
   commandName: z.string().default("paseo-acp-harness"),
   displayName: z.string().default("Paseo ACP (dim)"),
-  provider: z.string().default("codex/gpt-5.6-sol"),
+  // 空 = 交给 Paseo 选择该族默认模型（避免写死的模型下线后建 agent 失败）。
+  provider: z.string().default(""),
   agentName: z.string().default("Paseo Runner"),
   restartDaemon: z.boolean().default(true),
 });
@@ -40,7 +41,7 @@ export const MulticaSettingsSchema = z.object({
     runtimeType: "dim",
     commandName: "paseo-acp-harness",
     displayName: "Paseo ACP (dim)",
-    provider: "codex/gpt-5.6-sol",
+    provider: "",
     agentName: "Paseo Runner",
     restartDaemon: true,
   }),

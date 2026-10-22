@@ -123254,6 +123254,81 @@ function readLocalCredential() {
     return void 0;
   }
 }
+function readRecordedTaskId(agentId) {
+  const path = (0, import_node_path.join)((0, import_node_os.homedir)(), ".paseo", "plugin-data", "paseo-multica", "task-sessions.jsonl");
+  try {
+    const lines = (0, import_node_fs.readFileSync)(path, "utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line || !line.trim()) continue;
+      const row = JSON.parse(line);
+      if (row.agentId === agentId && row.taskId) return row.taskId;
+    }
+  } catch {
+  }
+  return "";
+}
+function issueWorkspacePath() {
+  return (0, import_node_path.join)((0, import_node_os.homedir)(), ".paseo", "plugin-data", "paseo-multica", "issue-workspaces.jsonl");
+}
+function readIssueWorkspace(issueId) {
+  let content = "";
+  try {
+    content = (0, import_node_fs.readFileSync)(issueWorkspacePath(), "utf8");
+  } catch {
+    return null;
+  }
+  const expectedServer = (process.env.MULTICA_SERVER_URL ?? "").replace(/\/+$/, "");
+  const expectedWorkspace = process.env.MULTICA_WORKSPACE_ID ?? "";
+  let found = null;
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row.issueId !== issueId || !row.workspaceId) continue;
+      if (expectedServer && (row.serverUrl ?? "").replace(/\/+$/, "") !== expectedServer) continue;
+      if (expectedWorkspace && row.multicaWorkspaceId !== expectedWorkspace) continue;
+      if (!found || (row.at ?? "") > found.at) found = row;
+    } catch {
+    }
+  }
+  return found;
+}
+function recordIssueWorkspace(issueId, workspaceId2, cwd) {
+  try {
+    const dir = (0, import_node_path.join)((0, import_node_os.homedir)(), ".paseo", "plugin-data", "paseo-multica");
+    (0, import_node_fs.mkdirSync)(dir, { recursive: true });
+    (0, import_node_fs.appendFileSync)(
+      issueWorkspacePath(),
+      `${JSON.stringify({
+        issueId,
+        workspaceId: workspaceId2,
+        cwd,
+        serverUrl: process.env.MULTICA_SERVER_URL ?? "",
+        multicaWorkspaceId: process.env.MULTICA_WORKSPACE_ID ?? "",
+        at: (/* @__PURE__ */ new Date()).toISOString()
+      })}
+`
+    );
+  } catch {
+  }
+}
+function sameDirectory(a, b) {
+  try {
+    return (0, import_node_fs.realpathSync)(a) === (0, import_node_fs.realpathSync)(b);
+  } catch {
+    return a === b;
+  }
+}
+async function findReusableWorkspace(client, issueId, cwd) {
+  const record2 = readIssueWorkspace(issueId);
+  if (!record2) return null;
+  const handle = client.workspaces.ref(record2.workspaceId);
+  const snapshot = await handle.refresh().catch(() => null);
+  const directory = snapshot?.workspaceDirectory;
+  if (!directory || !sameDirectory(directory, cwd)) return null;
+  return handle;
+}
 var multicaProjectId;
 async function ensureMulticaProjectId(client) {
   if (multicaProjectId !== void 0) return multicaProjectId ?? void 0;
@@ -123308,7 +123383,7 @@ function recordTaskSession(agentId, paseoWorkspaceId) {
   } catch {
   }
 }
-var DEFAULT_PROVIDER = process.env.PASEO_PROVIDER ?? "codex/gpt-5.6-sol";
+var DEFAULT_PROVIDER = process.env.PASEO_PROVIDER?.trim() ?? "";
 function forwardMulticaEnv() {
   const out = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -123351,6 +123426,9 @@ async function fetchIssueTitle(issueId) {
 function pickProvider(provider) {
   return provider && provider.trim() ? provider.trim() : DEFAULT_PROVIDER;
 }
+function providerFamily(provider) {
+  return providerFamilyOf(provider || "codex");
+}
 function providerFamilyOf(provider) {
   const idx = provider.indexOf("/");
   return idx >= 0 ? provider.slice(0, idx) : provider;
@@ -123376,7 +123454,7 @@ async function listAllFamilies(client) {
     if (ids.length) return ids;
   } catch {
   }
-  return [providerFamilyOf(DEFAULT_PROVIDER)];
+  return [providerFamily(DEFAULT_PROVIDER)];
 }
 async function collectModels(client, families) {
   const groups = await Promise.all(
@@ -123399,7 +123477,7 @@ async function collectModels(client, families) {
   return groups.flat();
 }
 function toCatalog(entries) {
-  const defaultFamily = providerFamilyOf(DEFAULT_PROVIDER);
+  const defaultFamily = providerFamily(DEFAULT_PROVIDER);
   const currentModelId = entries.find((e) => e.modelId === DEFAULT_PROVIDER)?.modelId ?? entries.find((e) => e.family === defaultFamily && e.isDefault)?.modelId ?? entries.find((e) => e.family === defaultFamily)?.modelId ?? entries.find((e) => e.isDefault)?.modelId ?? entries[0]?.modelId ?? "";
   return { currentModelId, availableModels: entries.map(({ modelId, name }) => ({ modelId, name })) };
 }
@@ -123507,16 +123585,16 @@ async function createRealBridge(url3) {
     async newSession({ cwd, model, mcpServers, materialize }) {
       await ensureConnected();
       const providerString = pickProvider(model);
-      const providerFamily = providerFamilyOf(providerString);
+      const providerFamily2 = providerFamilyOf(providerString || "codex");
       const agentId = crypto.randomUUID();
       if (!materialize) {
-        sessions.set(agentId, { cwd, providerFamily, agentId, providerString });
-        return { sessionId: agentId, providerFamily, currentModelId: "" };
+        sessions.set(agentId, { cwd, providerFamily: providerFamily2, agentId, providerString });
+        return { sessionId: agentId, providerFamily: providerFamily2, currentModelId: "" };
       }
       const configOptions = await thinkingOptionFor(providerString);
       sessions.set(agentId, {
         cwd,
-        providerFamily,
+        providerFamily: providerFamily2,
         agentId,
         providerString,
         mcpServers: mapMcpServers(mcpServers),
@@ -123524,7 +123602,7 @@ async function createRealBridge(url3) {
       });
       return {
         sessionId: agentId,
-        providerFamily,
+        providerFamily: providerFamily2,
         currentModelId: providerString,
         ...configOptions ? { configOptions: [configOptions] } : {}
       };
@@ -123534,9 +123612,20 @@ async function createRealBridge(url3) {
       const agent2 = client.agents.ref(sessionId);
       const snap = await agent2.refresh().catch(() => null);
       const actual = snap?.agent ?? null;
+      const currentTaskId = process.env.MULTICA_TASK_ID?.trim() ?? "";
+      if (actual && currentTaskId) {
+        const recordedTaskId = actual.labels?.["multica.taskId"] || readRecordedTaskId(sessionId);
+        if (recordedTaskId !== currentTaskId) {
+          process.stderr.write(
+            `[harness] resume rejected: task ${recordedTaskId || "<unknown>"} -> ${currentTaskId} (agent ${sessionId})
+`
+          );
+          throw new RequestError(-32603, "Session not found");
+        }
+      }
       if (actual?.workspaceId) recordTaskSession(sessionId, actual.workspaceId);
       const known = sessions.get(sessionId);
-      const family = actual?.provider ?? known?.providerFamily ?? providerFamilyOf(DEFAULT_PROVIDER);
+      const family = actual?.provider ?? known?.providerFamily ?? providerFamily(DEFAULT_PROVIDER);
       const modelPart = actual?.model ?? "";
       const providerString = actual ? modelPart ? modelPart.includes("/") ? modelPart : `${family}/${modelPart}` : family : known?.providerString ?? DEFAULT_PROVIDER;
       sessions.set(sessionId, {
@@ -123555,14 +123644,14 @@ async function createRealBridge(url3) {
       );
       return { sessionId, providerFamily: family, currentModelId: providerString };
     },
-    async listModels(providerFamily) {
+    async listModels(providerFamily2) {
       await ensureConnected();
-      if (!providerFamily && catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
+      if (!providerFamily2 && catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
         return catalogCache.value;
       }
-      const families = providerFamily ? [providerFamily] : await listAllFamilies(client);
+      const families = providerFamily2 ? [providerFamily2] : await listAllFamilies(client);
       const catalog = toCatalog(await collectModels(client, families));
-      if (!providerFamily && catalog.availableModels.length > 0) {
+      if (!providerFamily2 && catalog.availableModels.length > 0) {
         catalogCache = { at: Date.now(), value: catalog };
       }
       return catalog;
@@ -123608,9 +123697,14 @@ async function createRealBridge(url3) {
       if (!entry) throw new Error(`unknown session: ${sessionId}`);
       await ensureConnected();
       if (!entry.existing) {
+        const issueId = issueIdFromPrompt(text);
         if (!entry.title) {
-          const fromIssue = await fetchIssueTitle(issueIdFromPrompt(text));
+          const fromIssue = await fetchIssueTitle(issueId);
           entry.title = fromIssue || "Multica \u4EFB\u52A1";
+        }
+        if (!entry.workspace) {
+          const reusable = issueId ? await findReusableWorkspace(client, issueId, entry.cwd) : null;
+          if (reusable) entry.workspace = reusable;
         }
         if (!entry.workspace) {
           const projectId = await ensureMulticaProjectId(client);
@@ -123622,6 +123716,20 @@ async function createRealBridge(url3) {
               ...projectId ? { projectId } : {}
             }
           });
+          if (issueId) recordIssueWorkspace(issueId, entry.workspace.id, entry.cwd);
+        } else {
+          process.stderr.write(
+            `[harness] workspace reused issue=${issueId} workspace=${entry.workspace.id}
+`
+          );
+        }
+        if (!entry.providerString) {
+          const family = providerFamily(DEFAULT_PROVIDER);
+          const entries = await collectModels(client, [family]);
+          entry.providerString = toCatalog(entries).currentModelId || entries[0]?.modelId || "";
+          if (!entry.providerString) throw new Error(`no model available for provider ${family}`);
+          process.stderr.write(`[harness] provider default resolved ${entry.providerString}
+`);
         }
         const yolo = await resolveYolo(entry.providerString, entry.cwd);
         await entry.workspace.agents.create({
@@ -123635,7 +123743,9 @@ async function createRealBridge(url3) {
           },
           title: entry.title,
           // Paseo daemon 拉起 agent 时不继承本进程环境，必须显式透传 Multica 注入的任务级变量。
-          env: forwardMulticaEnv()
+          env: forwardMulticaEnv(),
+          // 记录所属 task：resume 时据此判断 env 里的 token 是否仍属于当前 task。
+          ...process.env.MULTICA_TASK_ID ? { labels: { "multica.taskId": process.env.MULTICA_TASK_ID } } : {}
         });
         entry.existing = true;
         recordTaskSession(entry.agentId, entry.workspace.id);
