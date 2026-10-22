@@ -36,6 +36,40 @@ interface RawAgent {
   name: string;
   avatar_url?: string | null;
   status?: string | null;
+  runtime_id?: string | null;
+}
+
+interface RawRuntimeProfile {
+  id: string;
+  display_name?: string | null;
+  command_name?: string | null;
+  protocol_family?: string | null;
+  enabled?: boolean | null;
+}
+
+interface RawRuntime {
+  id: string;
+  name?: string | null;
+  status?: string | null;
+  provider?: string | null;
+  profile_id?: string | null;
+  last_seen_at?: string | null;
+}
+
+export interface MulticaTask {
+  id: string;
+  agent_id: string;
+  runtime_id?: string | null;
+  issue_id?: string | null;
+  issue_identifier?: string | null;
+  workspace_slug?: string | null;
+  status: string;
+  trigger_summary?: string | null;
+  dispatched_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at?: string | null;
+  error?: string | null;
 }
 
 interface RawProject {
@@ -182,6 +216,61 @@ export class MulticaClient {
     });
   }
 
+  // 工作区的自定义 runtime profile（用于识别本机 Paseo 接入）。
+  async runtimeProfiles(): Promise<
+    Array<{ id: string; displayName: string; commandName: string; protocolFamily: string; enabled: boolean }>
+  > {
+    if (!this.inst.workspaceId) return [];
+    const raw = await this.send<{ runtime_profiles?: RawRuntimeProfile[] } | RawRuntimeProfile[]>(
+      "GET",
+      `/api/workspaces/${encodeURIComponent(this.inst.workspaceId)}/runtime-profiles`,
+    );
+    const rows = Array.isArray(raw) ? raw : raw.runtime_profiles ?? [];
+    return rows.map((row) => ({
+      id: row.id,
+      displayName: row.display_name ?? "",
+      commandName: row.command_name ?? "",
+      protocolFamily: row.protocol_family ?? "",
+      enabled: row.enabled !== false,
+    }));
+  }
+
+  // 当前用户可见的 runtime 实例。
+  async runtimes(): Promise<
+    Array<{
+      id: string;
+      name: string;
+      status: string;
+      provider: string;
+      profileId: string | null;
+      lastSeenAt: string | null;
+    }>
+  > {
+    const raw = await this.send<RawRuntime[]>("GET", "/api/runtimes?owner=me");
+    return (raw ?? []).map((row) => ({
+      id: row.id,
+      name: row.name ?? "",
+      status: row.status ?? "",
+      provider: row.provider ?? "",
+      profileId: row.profile_id ?? null,
+      lastSeenAt: row.last_seen_at ?? null,
+    }));
+  }
+
+  // 工作区内所有进行中任务 + 每个 agent 最近一次终态任务。
+  async agentTaskSnapshot(): Promise<MulticaTask[]> {
+    return (await this.send<MulticaTask[]>("GET", "/api/agent-task-snapshot")) ?? [];
+  }
+
+  // 当前 workspace 的 slug（用于拼接网页链接）。
+  async workspaceSlug(): Promise<string> {
+    return this.ensureSlug();
+  }
+
+  async cancelTask(taskId: string): Promise<void> {
+    await this.send("POST", `/api/tasks/${encodeURIComponent(taskId)}/cancel`, {});
+  }
+
   async listMembers(): Promise<Array<{ id: string; name: string; email: string; avatarUrl: string | null }>> {
     if (!this.inst.workspaceId) return [];
     const raw = await this.send<RawMember[]>(
@@ -202,6 +291,7 @@ export class MulticaClient {
     return (raw ?? []).map((a) => ({
       id: a.id,
       name: a.name,
+      runtimeId: a.runtime_id ?? null,
       avatarUrl: a.avatar_url ?? null,
       status: a.status ?? "idle",
     }));

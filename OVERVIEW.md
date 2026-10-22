@@ -4,6 +4,8 @@
 
 ## 它做什么
 
+- 每个 agent 的输入框旁有一个「Multica」药丸，点开是 agent 面板：展示该会话关联的卡片（标识、状态、优先级、描述、更新时间）与最近一次任务（状态、耗时、触发摘要），可打开卡片、取消进行中的任务或解除关联。
+- 一个「本机任务」侧边栏项目：列出 Multica 派发到本机 Paseo 运行时的任务（排队/已派发/运行中/等待目录与最近完成），5 秒轮询；可打开对应 Multica 卡片、跳到 Paseo 会话（Electron）或取消任务。
 - 一个侧边栏项目「Multica」：主体是看板（切换本机 Multica profile 与工作区，工作区一排可跳转 Multica 网页；卡片按状态分列展示，可跳转卡片网页），标题行右侧的「运行时接入」按钮切换到安装器视图，「返回看板」可切回。
 - 看板交互：每列头部「+」在该列内联新建卡片；卡片左侧「≡」手柄拖动到另一列即修改状态（以半列宽为切换阈值，拖动时目标列高亮）；卡片上不再放改状态的按钮。
 - 一个可搜索的附件源：在任意会话的输入框里搜到 Multica 卡片并附加，作为该次提示的上下文。
@@ -14,11 +16,21 @@
 
 插件服务端在本机直连 Multica 的 HTTP API（`/api/issues`、`/api/agents`、`/api/issue-statuses` 等），并使用 Multica CLI 的访问令牌鉴权。看板的 profile 列表直接来自本机 Multica CLI：默认 `~/.multica/config.json` 与 `~/.multica/profiles/<名>/config.json`，切换 profile 后工作区列表取自该服务端的 `/api/workspaces`。插件设置里的实例仍用于附件源与会话回写。凭据只在守护进程侧读取，不会出现在界面里。
 
+## Agent 面板与药丸
+
+药丸和面板按 Paseo agent 注册。打开面板时，插件先看是否有 `/multica-link` 关联，否则用 harness 写入的任务映射（`task-sessions.jsonl`）反查该会话对应的 Multica 服务端，再取 `/api/agent-task-snapshot` 中该 agent 的任务与 issue 详情。取消任务通过 `agent.cancel-task` 在服务端重新解析目标实例，因此面板不需要知道 profile。没有关联也没有任务映射时，面板提示使用 `/multica-link <卡片标识>`。
+
+## 本机任务
+
+「本机任务」屏通过 Multica 的 runtime profile、runtime 与 agent 关系识别本机 Paseo 接入：先读工作区的 `runtime-profiles`，筛出 `command_name` 与插件设置一致的 profile，再用 `/api/runtimes` 找对应 runtime，最后用 `/api/agents` 的 `runtime_id` 得到本机 agents。任务列表取自 `/api/agent-task-snapshot`（进行中任务 + 每个 agent 最近一次终态任务），卡片标题由 `/api/issues` 补齐；取消调用 `POST /api/tasks/{id}/cancel`。
+
+任务与 Paseo 会话的映射由 harness 写入 `~/.paseo/plugin-data/paseo-multica/task-sessions.jsonl`（`MULTICA_TASK_ID` + 实际 `agentId` + Paseo 工作区），插件读取最新一条。仅在 Electron 提供「会话」跳转（`navigation.openAgent`）；没有映射的旧任务不显示该按钮。
+
 ## 运行时接入（安装器）
 
 「运行时接入」视图（从「Multica」看板顶栏进入）把本机 Paseo 注册成一个自定义 Multica 运行时（走 ACP，协议族默认 `dim`），此后 Multica 派发的卡片任务会由本机 Paseo（经 `paseo-acp-harness`）执行，Paseo 的实时输出会回流为 Multica 的任务消息，Multica 选择的模型也会透传给 Paseo。
 
-接入后：Multica 把卡片派给绑定该运行时的 agent，任务由本机 Paseo 执行；同一卡片续跑时 harness 会**复用同一个 Paseo 工作区/对话**（`session/resume`），而不是每次新建；Multica 选的模型与推理档位、以及（Paseo 侧发起的）工具权限都会透传。
+接入后：Multica 把卡片派给绑定该运行时的 agent，任务由本机 Paseo 执行；所有任务会归入 Multica 工作区根目录对应的 Paseo 项目（daemon 注入的 `MULTICA_TASK_WORKSPACES_ROOT`，默认 `~/multica_workspaces`，可用 `PASEO_MULTICA_PROJECT_ROOT` 覆盖），每个任务仍有独立的 workspace 与 agent tab；同一卡片续跑时 harness 会**复用同一个 Paseo 工作区/对话**（`session/resume`），而不是每次新建；Multica 选的模型与推理档位、以及（Paseo 侧发起的）工具权限都会透传。
 
 「一键接入」幂等地执行：
 

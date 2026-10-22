@@ -108,6 +108,7 @@ export const AgentRefSchema = z.object({
   name: z.string(),
   avatarUrl: z.string().nullable(),
   status: z.string(),
+  runtimeId: z.string().nullable(),
 });
 
 export const ProjectRefSchema = z.object({

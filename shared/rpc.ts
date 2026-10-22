@@ -56,6 +56,73 @@ export const boardProfilesRpc = defineRpc({
   }),
 });
 
+// 本机 Paseo 运行时上的任务（Multica 派发）。
+export const TaskViewSchema = z.object({
+  id: z.string(),
+  agentId: z.string(),
+  agentName: z.string(),
+  issueId: z.string(),
+  issueIdentifier: z.string(),
+  issueTitle: z.string(),
+  workspaceSlug: z.string(),
+  status: z.string(),
+  triggerSummary: z.string().nullable(),
+  dispatchedAt: z.string().nullable(),
+  startedAt: z.string().nullable(),
+  completedAt: z.string().nullable(),
+  createdAt: z.string(),
+  sessionId: z.string().nullable(),
+  paseoWorkspaceId: z.string().nullable(),
+  error: z.string().nullable(),
+});
+
+export const tasksSnapshotRpc = defineRpc({
+  name: "tasks.snapshot",
+  input: z.object({ instanceId, profile, workspaceId }),
+  output: z.object({
+    runtime: z
+      .object({
+        id: z.string(),
+        name: z.string(),
+        status: z.string(),
+        provider: z.string(),
+        lastSeenAt: z.string().nullable(),
+      })
+      .nullable(),
+    agents: z.array(z.object({ id: z.string(), name: z.string() })),
+    tasks: z.array(TaskViewSchema),
+    error: z.string().nullable(),
+  }),
+});
+
+// 单个 Paseo 会话对应的 Multica 卡片与任务（用于 agent 面板 / composer pill）。
+export const agentContextRpc = defineRpc({
+  name: "agent.context",
+  input: z.object({ agentId: z.string().min(1) }),
+  output: z.object({
+    linked: z.boolean(),
+    issue: IssueSchema.nullable(),
+    task: TaskViewSchema.nullable(),
+    instance: z
+      .object({ label: z.string(), serverUrl: z.string(), appUrl: z.string(), workspaceSlug: z.string() })
+      .nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
+// 按 Paseo 会话取消其当前任务（服务端自行解析目标实例）。
+export const agentCancelTaskRpc = defineRpc({
+  name: "agent.cancel-task",
+  input: z.object({ agentId: z.string().min(1), taskId: z.string().min(1) }),
+  output: z.object({ ok: z.boolean(), error: z.string().nullable() }),
+});
+
+export const tasksCancelRpc = defineRpc({
+  name: "tasks.cancel",
+  input: z.object({ instanceId, profile, workspaceId, taskId: z.string().min(1) }),
+  output: z.object({ ok: z.boolean(), error: z.string().nullable() }),
+});
+
 // 指定 profile 下可用的工作区。
 export const boardWorkspacesRpc = defineRpc({
   name: "board.workspaces",

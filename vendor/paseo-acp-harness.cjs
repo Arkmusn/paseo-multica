@@ -123254,6 +123254,60 @@ function readLocalCredential() {
     return void 0;
   }
 }
+var multicaProjectId;
+async function ensureMulticaProjectId(client) {
+  if (multicaProjectId !== void 0) return multicaProjectId ?? void 0;
+  const root = process.env.PASEO_MULTICA_PROJECT_ROOT?.trim() || process.env.MULTICA_TASK_WORKSPACES_ROOT?.trim() || (0, import_node_path.join)((0, import_node_os.homedir)(), "multica_workspaces");
+  try {
+    const payload = await client.projects.list();
+    const rows = payload.projects ?? payload;
+    const existing = rows.find((row) => (row.projectRootPath ?? row.rootPath) === root);
+    if (existing?.projectId) {
+      multicaProjectId = existing.projectId;
+      return existing.projectId;
+    }
+    (0, import_node_fs.mkdirSync)(root, { recursive: true });
+    const bootstrap = await client.workspaces.create({
+      title: "Multica",
+      source: { kind: "directory", path: root }
+    });
+    const snapshot = await bootstrap.refresh().catch(() => null);
+    const projectId = snapshot?.projectId;
+    await bootstrap.archive().catch(() => void 0);
+    multicaProjectId = projectId ?? null;
+    if (projectId) {
+      process.stderr.write(`[harness] Multica project ready id=${projectId} root=${root}
+`);
+    }
+    return projectId ?? void 0;
+  } catch (error62) {
+    multicaProjectId = null;
+    process.stderr.write(`[harness] Multica project resolve failed: ${String(error62)}
+`);
+    return void 0;
+  }
+}
+function recordTaskSession(agentId, paseoWorkspaceId) {
+  const taskId = process.env.MULTICA_TASK_ID;
+  if (!taskId || !paseoWorkspaceId) return;
+  try {
+    const dir = (0, import_node_path.join)((0, import_node_os.homedir)(), ".paseo", "plugin-data", "paseo-multica");
+    (0, import_node_fs.mkdirSync)(dir, { recursive: true });
+    (0, import_node_fs.appendFileSync)(
+      (0, import_node_path.join)(dir, "task-sessions.jsonl"),
+      `${JSON.stringify({
+        taskId,
+        agentId,
+        paseoWorkspaceId,
+        serverUrl: process.env.MULTICA_SERVER_URL ?? "",
+        multicaWorkspaceId: process.env.MULTICA_WORKSPACE_ID ?? "",
+        at: (/* @__PURE__ */ new Date()).toISOString()
+      })}
+`
+    );
+  } catch {
+  }
+}
 var DEFAULT_PROVIDER = process.env.PASEO_PROVIDER ?? "codex/gpt-5.6-sol";
 function forwardMulticaEnv() {
   const out = {};
@@ -123480,6 +123534,7 @@ async function createRealBridge(url3) {
       const agent2 = client.agents.ref(sessionId);
       const snap = await agent2.refresh().catch(() => null);
       const actual = snap?.agent ?? null;
+      if (actual?.workspaceId) recordTaskSession(sessionId, actual.workspaceId);
       const known = sessions.get(sessionId);
       const family = actual?.provider ?? known?.providerFamily ?? providerFamilyOf(DEFAULT_PROVIDER);
       const modelPart = actual?.model ?? "";
@@ -123558,9 +123613,14 @@ async function createRealBridge(url3) {
           entry.title = fromIssue || "Multica \u4EFB\u52A1";
         }
         if (!entry.workspace) {
+          const projectId = await ensureMulticaProjectId(client);
           entry.workspace = await client.workspaces.create({
             title: entry.title,
-            source: { kind: "directory", path: entry.cwd }
+            source: {
+              kind: "directory",
+              path: entry.cwd,
+              ...projectId ? { projectId } : {}
+            }
           });
         }
         const yolo = await resolveYolo(entry.providerString, entry.cwd);
@@ -123578,6 +123638,7 @@ async function createRealBridge(url3) {
           env: forwardMulticaEnv()
         });
         entry.existing = true;
+        recordTaskSession(entry.agentId, entry.workspace.id);
         const created = await client.agents.ref(entry.agentId).refresh().catch(() => null);
         const yoloDesc = yolo.featureValues ? `features=${JSON.stringify(yolo.featureValues)}` : yolo.modeId ? `mode=${yolo.modeId}` : "yolo=(provider default)";
         process.stderr.write(

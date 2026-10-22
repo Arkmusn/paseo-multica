@@ -1,7 +1,11 @@
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import type { PluginServerContext, PluginSettings } from "@getpaseo/plugin/server";
-import { MulticaSettingsSchema, type MulticaSettingsValues } from "../shared/model";
+import { MulticaSettingsSchema, type Issue, type MulticaSettingsValues } from "../shared/model";
 import {
+  agentCancelTaskRpc,
+  agentContextRpc,
   boardProfilesRpc,
   boardSnapshotRpc,
   boardWorkspacesRpc,
@@ -14,6 +18,8 @@ import {
   linksClearRpc,
   linksGetRpc,
   linksSetRpc,
+  tasksCancelRpc,
+  tasksSnapshotRpc,
 } from "../shared/rpc";
 import {
   listCliProfiles,
@@ -24,7 +30,7 @@ import {
   type ResolvedInstance,
 } from "./config";
 import { clearLink, getLink, setLink } from "./links";
-import { MulticaClient } from "./multica";
+import { MulticaClient, type MulticaTask } from "./multica";
 
 const EMPTY_SETTINGS: MulticaSettingsValues = MulticaSettingsSchema.parse({});
 
@@ -110,6 +116,137 @@ export function registerHandlers(
       return { workspaces: await new MulticaClient(inst).workspaces(), error: null };
     } catch (error) {
       return { workspaces: [], error: message(error) };
+    }
+  });
+
+  server.handle(tasksSnapshotRpc, async (input) => {
+    const resolved = await resolve(settings);
+    const inst = resolveTarget(resolved, input);
+    const client = new MulticaClient(inst);
+    try {
+      const [profiles, runtimes, agents] = await Promise.all([
+        client.runtimeProfiles(),
+        client.runtimes(),
+        client.listAgents(),
+      ]);
+
+      const commandName = resolved.values.runtime.commandName;
+      const ourProfileIds = new Set(
+        profiles.filter((profile) => profile.commandName === commandName && profile.enabled).map((p) => p.id),
+      );
+      const ourRuntimes = runtimes.filter((runtime) => runtime.profileId && ourProfileIds.has(runtime.profileId));
+      const runtime = ourRuntimes.find((row) => row.status === "online") ?? ourRuntimes[0] ?? null;
+      if (!runtime) {
+        return {
+          runtime: null,
+          agents: [],
+          tasks: [],
+          error: "未找到本机 Paseo 运行时：请先在「运行时接入」完成接入。",
+        };
+      }
+
+      const runtimeIds = new Set(ourRuntimes.map((row) => row.id));
+      const ourAgents = agents.filter((agent) => agent.runtimeId && runtimeIds.has(agent.runtimeId));
+      const agentIds = new Set(ourAgents.map((agent) => agent.id));
+
+      const [rawTasks, issues] = await Promise.all([client.agentTaskSnapshot(), client.listIssues()]);
+      const issueById = new Map(issues.map((issue) => [issue.id, issue]));
+      const agentById = new Map(ourAgents.map((agent) => [agent.id, agent]));
+      const sessions = readTaskSessions(inst.serverUrl);
+
+      const tasks = rawTasks
+        .filter((task) => agentIds.has(task.agent_id))
+        .map((task) => toTaskView(task, issueById, agentById, sessions));
+
+      return {
+        runtime: {
+          id: runtime.id,
+          name: runtime.name,
+          status: runtime.status,
+          provider: runtime.provider,
+          lastSeenAt: runtime.lastSeenAt,
+        },
+        agents: ourAgents.map((agent) => ({ id: agent.id, name: agent.name })),
+        tasks,
+        error: null,
+      };
+    } catch (error) {
+      return { runtime: null, agents: [], tasks: [], error: message(error) };
+    }
+  });
+
+  server.handle(agentContextRpc, async ({ agentId }) => {
+    const resolved = await resolve(settings);
+    const target = resolveAgentTarget(resolved, agentId);
+    if (!target) {
+      return {
+        linked: false,
+        issue: null,
+        task: null,
+        instance: null,
+        error: "未找到该会话对应的 Multica 服务端：请先 /multica-link 关联，或让卡片由本机运行时执行。",
+      };
+    }
+
+    const client = new MulticaClient(target.inst);
+    try {
+      const [rawTasks, workspaceSlug, link] = await Promise.all([
+        client.agentTaskSnapshot(),
+        client.workspaceSlug(),
+        Promise.resolve(getLink(agentId)),
+      ]);
+      const agentTasks = rawTasks.filter((task) => task.agent_id === agentId);
+      const active = agentTasks
+        .filter((task) => !TERMINAL_TASK_STATUSES.has(task.status))
+        .sort((a, b) => Date.parse(b.created_at ?? "") - Date.parse(a.created_at ?? ""))[0];
+      const latest =
+        active ??
+        agentTasks.sort((a, b) => Date.parse(b.created_at ?? "") - Date.parse(a.created_at ?? ""))[0] ??
+        null;
+
+      const issueId = link?.issueId || latest?.issue_id || "";
+      const issue = issueId ? await client.getIssue(issueId).catch(() => null) : null;
+      const sessions = readTaskSessions(target.inst.serverUrl);
+      const issueById = new Map<string, Issue>(issue ? [[issue.id, issue]] : []);
+      const agentById = new Map([[agentId, { id: agentId, name: "" }]]);
+
+      return {
+        linked: !!link,
+        issue,
+        task: latest ? toTaskView(latest, issueById, agentById, sessions) : null,
+        instance: {
+          label: target.inst.label,
+          serverUrl: target.inst.serverUrl,
+          appUrl: target.inst.appUrl,
+          workspaceSlug,
+        },
+        error: null,
+      };
+    } catch (error) {
+      return { linked: false, issue: null, task: null, instance: null, error: message(error) };
+    }
+  });
+
+  server.handle(agentCancelTaskRpc, async ({ agentId, taskId }) => {
+    const resolved = await resolve(settings);
+    const target = resolveAgentTarget(resolved, agentId);
+    if (!target) return { ok: false, error: "未找到该会话对应的 Multica 服务端" };
+    try {
+      await new MulticaClient(target.inst).cancelTask(taskId);
+      return { ok: true, error: null };
+    } catch (error) {
+      return { ok: false, error: message(error) };
+    }
+  });
+
+  server.handle(tasksCancelRpc, async (input) => {
+    const resolved = await resolve(settings);
+    const inst = resolveTarget(resolved, input);
+    try {
+      await new MulticaClient(inst).cancelTask(input.taskId);
+      return { ok: true, error: null };
+    } catch (error) {
+      return { ok: false, error: message(error) };
     }
   });
 
@@ -215,6 +352,161 @@ export function registerHandlers(
     return { link: getLink(agentId) };
   });
 
+}
+
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+function toTaskView(
+  task: MulticaTask,
+  issueById: Map<string, Issue>,
+  agentById: Map<string, { id: string; name: string }>,
+  sessions: Map<string, { agentId: string; paseoWorkspaceId: string }>,
+) {
+  const issue = issueById.get(task.issue_id ?? "");
+  const session = sessions.get(task.id);
+  return {
+    id: task.id,
+    agentId: task.agent_id,
+    agentName: agentById.get(task.agent_id)?.name ?? "",
+    issueId: task.issue_id ?? "",
+    issueIdentifier: issue?.identifier ?? "",
+    issueTitle: issue?.title ?? "",
+    workspaceSlug: task.workspace_slug ?? "",
+    status: task.status,
+    triggerSummary: task.trigger_summary ?? null,
+    dispatchedAt: task.dispatched_at ?? null,
+    startedAt: task.started_at ?? null,
+    completedAt: task.completed_at ?? null,
+    createdAt: task.created_at ?? "",
+    sessionId: session?.agentId ?? null,
+    paseoWorkspaceId: session?.paseoWorkspaceId ?? "",
+    error: task.error ?? null,
+  };
+}
+
+function normalizeServerUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "");
+}
+
+// 读取某个 Paseo agent 最近一次任务映射（harness 写入）。
+function readAgentSession(agentId: string): {
+  taskId: string;
+  paseoWorkspaceId: string;
+  serverUrl: string;
+  multicaWorkspaceId: string;
+} | null {
+  const path = join(homedir(), ".paseo", "plugin-data", "paseo-multica", "task-sessions.jsonl");
+  let content = "";
+  try {
+    content = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+
+  let found: {
+    taskId: string;
+    paseoWorkspaceId: string;
+    serverUrl: string;
+    multicaWorkspaceId: string;
+    at: string;
+  } | null = null;
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line) as {
+        taskId?: string;
+        agentId?: string;
+        paseoWorkspaceId?: string;
+        serverUrl?: string;
+        multicaWorkspaceId?: string;
+        at?: string;
+      };
+      if (row.agentId !== agentId || !row.taskId) continue;
+      if (!found || (row.at ?? "") > found.at) {
+        found = {
+          taskId: row.taskId,
+          paseoWorkspaceId: row.paseoWorkspaceId ?? "",
+          serverUrl: row.serverUrl ?? "",
+          multicaWorkspaceId: row.multicaWorkspaceId ?? "",
+          at: row.at ?? "",
+        };
+      }
+    } catch {
+      // 跳过损坏行。
+    }
+  }
+  return found;
+}
+
+// 一个 Paseo 会话属于哪个 Multica 服务端：优先显式关联的实例，其次 harness 记录的服务端。
+function resolveAgentTarget(
+  resolved: Resolved,
+  agentId: string,
+): { inst: ResolvedInstance; linked: boolean } | null {
+  const link = getLink(agentId);
+  if (link) {
+    // 看板/旧版起会话写入的是 profile 目标（profile:<name>），不是设置里的实例 id。
+    if (link.instanceId.startsWith("profile:")) {
+      const name = link.instanceId.slice("profile:".length);
+      const inst = resolveProfile(name === "default" ? "" : name);
+      if (inst?.token) return { inst, linked: true };
+    }
+    const inst = pickInstance(resolved.instances, resolved.activeId, link.instanceId);
+    if (inst?.token) return { inst, linked: true };
+  }
+
+  const session = readAgentSession(agentId);
+  if (session?.serverUrl) {
+    const profile = listCliProfiles().find(
+      (item) => normalizeServerUrl(item.serverUrl) === normalizeServerUrl(session.serverUrl),
+    );
+    if (profile) {
+      const inst = resolveProfile(profile.name, session.multicaWorkspaceId || profile.workspaceId);
+      if (inst?.token) return { inst, linked: false };
+    }
+  }
+
+  try {
+    return { inst: requireInstance(resolved), linked: false };
+  } catch {
+    return null;
+  }
+}
+
+// harness 追加写入的「Multica 任务 -> Paseo 会话」映射（最新一条生效）。
+function readTaskSessions(
+  serverUrl: string,
+): Map<string, { agentId: string; paseoWorkspaceId: string }> {
+  const out = new Map<string, { agentId: string; paseoWorkspaceId: string }>();
+  const path = join(homedir(), ".paseo", "plugin-data", "paseo-multica", "task-sessions.jsonl");
+  let content = "";
+  try {
+    content = readFileSync(path, "utf8");
+  } catch {
+    return out;
+  }
+
+  const expected = serverUrl.replace(/\/+$/, "");
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line) as {
+        taskId?: string;
+        agentId?: string;
+        paseoWorkspaceId?: string;
+        serverUrl?: string;
+      };
+      if (!row.taskId || !row.agentId) continue;
+      if (row.serverUrl && row.serverUrl.replace(/\/+$/, "") !== expected) continue;
+      out.set(row.taskId, {
+        agentId: row.agentId,
+        paseoWorkspaceId: row.paseoWorkspaceId ?? "",
+      });
+    } catch {
+      // 跳过损坏行。
+    }
+  }
+  return out;
 }
 
 function issueSnapshot(
